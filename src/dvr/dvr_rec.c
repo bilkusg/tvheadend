@@ -1440,6 +1440,12 @@ dvr_rec_start(dvr_entry_t *de, const streaming_start_t *ss)
   } else {
     htsmsg_destroy(info);
   }
+
+    //BLIX add comskip hack
+  dvr_spawn_cmd(de, 
+    "/usr/local/bin/tvhcomskip_during.sh  \"%t\" \"%s\" \"%d\" \"%c\" \"%p\" \"%g\" \"%i\" \"%Z\" \"%e\" \"%f\" ",
+    dvr_get_filename(de),
+    0);
   return 0;
 
 _err:
