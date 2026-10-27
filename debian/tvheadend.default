@@ -2,8 +2,9 @@
 # Default configuration for Tvheadend.
 
 # systemd
-# See tvheadend --help for more - default "-u hts -g video"
-OPTIONS="-u hts -g video"
+# See tvheadend --help for more - default "-u hts -g video -6"
+# -6 listens on IPv6 as well as IPv4, remove it to use IPv4 only
+OPTIONS="-u hts -g video -6"
 
 # sysvinit
 # 
@@ -35,7 +36,7 @@ TVH_ADAPTERS=""
 
 # TVH_IPV6
 #   if set to 1 will enable IPv6 support
-TVH_IPV6=0
+TVH_IPV6=1
 
 # TVH_HTTP_PORT
 #   if set to "" will use binary default

@@ -701,6 +701,14 @@ error:
   return HTTP_CON_SENDING;
 }
 
+/* A body without Content-Length or chunked framing ends with the stream */
+static int
+http_client_eof_completes( http_client_t *hc )
+{
+  return !hc->hc_chunked &&
+         (hc->hc_csize == 0 || hc->hc_csize == (size_t)-1);
+}
+
 static int
 http_client_finish( http_client_t *hc )
 {
@@ -724,8 +732,7 @@ http_client_finish( http_client_t *hc )
   wcmd = TAILQ_FIRST(&hc->hc_wqueue);
   if (wcmd)
     http_client_cmd_destroy(hc, wcmd);
-  if (hc->hc_version != RTSP_VERSION_1_0 &&
-      hc->hc_handle_location &&
+  if (hc->hc_handle_location &&
       (hc->hc_code == HTTP_STATUS_MOVED ||
        hc->hc_code == HTTP_STATUS_FOUND ||
        hc->hc_code == HTTP_STATUS_SEE_OTHER ||
@@ -757,9 +764,10 @@ http_client_finish( http_client_t *hc )
 static int
 http_client_parse_arg( http_arg_list_t *list, const char *p )
 {
+  char *buf = tvh_strdupa(p);
   char *d, *t;
 
-  d = strchr(p, ':');
+  d = strchr(buf, ':');
   if (d) {
     *d++ = '\0';
     while (*d && *d <= ' ')
@@ -767,7 +775,7 @@ http_client_parse_arg( http_arg_list_t *list, const char *p )
     t = d + strlen(d);
     while (--t != d && *t <= ' ')
       *t = '\0';
-    http_arg_set(list, p, d);
+    http_arg_set(list, buf, d);
     return 0;
   }
   return -EINVAL;
@@ -1014,14 +1022,15 @@ retry:
     r = recv(hc->hc_fd, buf, hc->hc_io_size, MSG_DONTWAIT);
   if (r == 0) {
     tvhtrace(LS_HTTPC, "%04X: end of stream", shortid(hc));
-    if (hc->hc_in_data && !hc->hc_keepalive) {
+    if (hc->hc_in_data && !hc->hc_keepalive && http_client_eof_completes(hc)) {
       tvhtrace(LS_HTTPC, "%04X: no keep-alive, finishing", shortid(hc));
       return http_client_finish(hc);
     }
     return http_client_flush(hc, -EIO);
   }
   if (r < 0) {
-    if (errno == EIO && hc->hc_in_data && !hc->hc_keepalive) {
+    if (errno == EIO && hc->hc_in_data && !hc->hc_keepalive &&
+        http_client_eof_completes(hc)) {
       tvhtrace(LS_HTTPC, "%04X: error reading: %s", shortid(hc), strerror(errno));
       tvhtrace(LS_HTTPC, "%04X: no keep-alive, finishing", shortid(hc));
       return http_client_finish(hc);
@@ -1110,6 +1119,9 @@ header:
       hc->hc_csize = -1;
   }
   p = http_arg_get(&hc->hc_args, "Connection");
+  /* An HTTP/1.0 connection persists only when the response asks for it */
+  if (ver == HTTP_VERSION_1_0 && !(p && http_arg_contains(p, "keep-alive")))
+    hc->hc_keepalive = 0;
   if (p && ver != RTSP_VERSION_1_0) {
     if (http_arg_contains(p, "close") || http_arg_contains(p, "upgrade")) /* Some servers
       send the upgrade header to switch to http2 even though we did not request this.
@@ -1139,8 +1151,13 @@ header:
     http_client_rbuf_cut(hc, hc->hc_hsize);
     goto next_header;
   }
-  if (hc->hc_version == RTSP_VERSION_1_0 &&
-     (hc->hc_csize == -1 || !hc->hc_csize)) {
+  if ((hc->hc_version == RTSP_VERSION_1_0 &&
+       (hc->hc_csize == -1 || !hc->hc_csize)) ||
+      /* No body, whatever Content-Length or Transfer-Encoding say */
+      (hc->hc_version != RTSP_VERSION_1_0 &&
+       (hc->hc_cmd == HTTP_CMD_HEAD ||
+        hc->hc_code == HTTP_STATUS_NO_CONTENT ||
+        hc->hc_code == HTTP_STATUS_NOT_MODIFIED))) {
     hc->hc_csize = -1;
     hc->hc_in_data = 0;
     http_client_rbuf_cut(hc, hc->hc_hsize);
@@ -1339,14 +1356,17 @@ http_client_simple_reconnect ( http_client_t *hc, const url_t *u,
 
   http_client_flush(hc, 0);
 
-  http_arg_init(&h);
-  hc->hc_hdr_create(hc, &h, u, 0);
   hc->hc_reconnected = 1;
   hc->hc_shutdown    = 0;
   hc->hc_pevents     = 0;
   hc->hc_version     = ver;
 
-  r = http_client_send(hc, hc->hc_cmd, u->path, u->query, &h, NULL, 0);
+  if (ver != RTSP_VERSION_1_0) {
+    http_arg_init(&h);
+    hc->hc_hdr_create(hc, &h, u, 0);
+    r = http_client_send(hc, hc->hc_cmd, u->path, u->query, &h, NULL, 0);
+  } else
+    r = http_client_send(hc, hc->hc_cmd, u->raw, u->query, NULL, NULL, 0);
   if (r < 0)
     return r;
 
@@ -1597,7 +1617,7 @@ http_client_connect
   tvh_mutex_init(&hc->hc_mutex, NULL);
   hc->hc_id      = atomic_add(&tally, 1);
   hc->hc_aux     = aux;
-  hc->hc_io_size = 1024;
+  hc->hc_io_size = 2048;
   hc->hc_rtsp_stream_id = -1;
   hc->hc_verify_peer = -1;
   hc->hc_bindaddr = bindaddr ? strdup(bindaddr) : NULL;

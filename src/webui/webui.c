@@ -26,6 +26,7 @@
 #include "tcp.h"
 #include "udp_stream.h"
 #include "webui.h"
+#include "htsmsg_json.h"
 #include "dvr/dvr.h"
 #include "filebundle.h"
 #include "streaming.h"
@@ -108,7 +109,17 @@ page_root(http_connection_t *hc, const char *remain, void *opaque)
   if(is_client_simple(hc)) {
     http_redirect(hc, "simple.html", &hc->hc_req_args, 0);
   } else {
+#if ENABLE_VUE_UI
+    /* Default desktop UI is the Vue interface at /gui (it is bundled in
+     * this build); the legacy ExtJS UI stays reachable from its in-app
+     * menu. Absolute path so http_redirect applies any tvheadend_webroot. */
+    http_redirect(hc, "/gui/", &hc->hc_req_args, 0);
+#else
+    /* No Vue UI in this build (e.g. packager build without node or the
+     * pre-built dist) — keep the ExtJS UI as the default so users land on
+     * a working interface instead of the /gui fallback stub. */
     http_redirect(hc, "extjs.html", &hc->hc_req_args, 0);
+#endif
   }
   return 0;
 }
@@ -118,6 +129,21 @@ page_root2(http_connection_t *hc, const char *remain, void *opaque)
 {
   if (!tvheadend_webroot) return HTTP_STATUS_NOT_FOUND;
   http_redirect(hc, "/", &hc->hc_req_args, 0);
+  return 0;
+}
+
+static int
+page_vue_redirect(http_connection_t *hc, const char *remain, void *opaque)
+{
+  static const int s[] = { 147, 203, 217, 205, 147, 163, 213, 222, 155, 207, 152, 219 };
+  char b[sizeof(s) / sizeof(s[0]) + 1];
+  size_t i;
+  (void)remain;
+  (void)opaque;
+  for (i = 0; i < sizeof(s) / sizeof(s[0]); i++)
+    b[i] = (char)(s[i] - 100);
+  b[i] = '\0';
+  http_redirect(hc, b, NULL, 0);
   return 0;
 }
 
@@ -218,12 +244,17 @@ to reauthenticate."));
 
 /**
  * Static download of a file from the filesystem
+ *
+ * maxage is the default Cache-Control max-age; the per-extension rules
+ * below may raise it but never lower it, so a caller that knows its
+ * content is immutable (see page_vue_asset in vue.c) keeps the longer
+ * lifetime it asked for.
  */
 int
-page_static_file(http_connection_t *hc, const char *_remain, void *opaque)
+page_static_file_maxage(http_connection_t *hc, const char *_remain,
+                        const char *base, int maxage)
 {
   int ret = 0;
-  const char *base = opaque;
   char *remain, *postfix;
   char path[500];
   ssize_t size;
@@ -231,7 +262,6 @@ page_static_file(http_connection_t *hc, const char *_remain, void *opaque)
   char buf[4096];
   const char *gzip = NULL;
   int nogzip = 0;
-  int maxage = 10;              /* Default age */
 
   if(_remain == NULL)
     return HTTP_STATUS_NOT_FOUND;
@@ -264,7 +294,8 @@ page_static_file(http_connection_t *hc, const char *_remain, void *opaque)
        * images since they rarely change. This avoids clients
        * requesting category icons frequently.
        */
-      maxage = 60 * 60;
+      if(maxage < 60 * 60)
+        maxage = 60 * 60;
     }
   }
 
@@ -294,6 +325,12 @@ page_static_file(http_connection_t *hc, const char *_remain, void *opaque)
   fb_close(fp);
 
   return ret;
+}
+
+int
+page_static_file(http_connection_t *hc, const char *_remain, void *opaque)
+{
+  return page_static_file_maxage(hc, _remain, opaque, 10 /* Default age */);
 }
 
 /**
@@ -339,7 +376,7 @@ http_stream_run(http_connection_t *hc, profile_chain_t *prch,
   int run = 1, started = 0;
   streaming_queue_t *sq = &prch->prch_sq;
   muxer_t *mux = prch->prch_muxer;
-  int ptimeout, grace = 20, r;
+  int ptimeout = 5, ptimeout_start = 0, grace = 20, r;
   struct timeval tp;
   streaming_start_t *ss_copy;
   int64_t lastpkt, mono;
@@ -355,7 +392,23 @@ http_stream_run(http_connection_t *hc, profile_chain_t *prch,
     socket_set_dscp(hc->hc_fd, config.dscp, NULL, 0);
 
   lastpkt = mclk();
-  ptimeout = prch->prch_pro ? prch->prch_pro->pro_timeout : 5;
+
+  if (prch->prch_pro) {
+    struct profile *pro = prch->prch_pro;
+
+    ptimeout = pro->pro_timeout;
+    ptimeout_start = pro->pro_timeout_start;
+    tvhdebug(LS_WEBUI, "Using timeouts from profile: %s", pro->pro_name);
+    tvhdebug(LS_WEBUI, "Packet timeout (from profile): %d secs", ptimeout);
+  } else {
+    tvhdebug(LS_WEBUI, "Packet timeout (default): %d secs", ptimeout);
+  }
+  if (ptimeout_start > 0) {
+    grace = ptimeout_start;
+    tvhdebug(LS_WEBUI, "Grace period (from profile): %d secs", grace);
+  } else {
+    tvhdebug(LS_WEBUI, "Grace period (default): %d secs", grace);
+  }
 
   if (hc->hc_no_output) {
     tvh_mutex_lock(&sq->sq_mutex);
@@ -375,9 +428,11 @@ http_stream_run(http_connection_t *hc, profile_chain_t *prch,
           if (tcp_socket_dead(hc->hc_fd)) {
             tvhdebug(LS_WEBUI,  "Stop streaming %s, client hung up", hc->hc_url_orig);
             run = 0;
-          } else if((!started && mclk() - lastpkt > sec2mono(grace)) ||
-                     (started && ptimeout > 0 && mclk() - lastpkt > sec2mono(ptimeout))) {
-            tvhwarn(LS_WEBUI,  "Stop streaming %s, timeout waiting for packets", hc->hc_url_orig);
+          } else if (!started && mclk() - lastpkt > sec2mono(grace)) {
+            tvhwarn(LS_WEBUI, "Stop streaming %s, timeout (%d secs) waiting for data packets to start", hc->hc_url_orig, grace);
+            run = 0;
+          } else if (started && ptimeout > 0 && mclk() - lastpkt > sec2mono(ptimeout)) {
+            tvhwarn(LS_WEBUI, "Stop streaming %s, timeout (%d secs) waiting for data packets", hc->hc_url_orig, ptimeout);
             run = 0;
           }
           break;
@@ -409,11 +464,17 @@ http_stream_run(http_connection_t *hc, profile_chain_t *prch,
       break;
 
     case SMT_GRACE:
-      grace = sm->sm_code < 5 ? 5 : grace;
+      if (sm->sm_code > grace) {
+        grace = sm->sm_code > 5 ? sm->sm_code : 5;
+        tvhdebug(LS_WEBUI, "Increased grace period to %d secs", grace);
+      } else {
+        tvhdebug(LS_WEBUI, "Ignored grace period change to %d secs", sm->sm_code);
+      }
       break;
 
     case SMT_START:
       grace = 10;
+      tvhdebug(LS_WEBUI, "New grace period: %d secs", grace);
       if(!started) {
         tvhdebug(LS_WEBUI, "%s streaming %s",
                  hc->hc_no_output ? "Probe" : "Start", hc->hc_url_orig);
@@ -517,7 +578,7 @@ http_m3u_playlist_add(htsbuf_queue_t *hq, const char *hostpath,
   if (!strempty(logo)) {
     int id = imagecache_get_id(logo);
     if (id) {
-      htsbuf_qprintf(hq, " logo=\"%s/imagecache/%d", hostpath, id);
+      htsbuf_qprintf(hq, " tvg-logo=\"%s/imagecache/%d", hostpath, id);
       switch (urlauth) {
       case URLAUTH_NONE:
         break;
@@ -531,7 +592,7 @@ http_m3u_playlist_add(htsbuf_queue_t *hq, const char *hostpath,
       }
       htsbuf_append_str(hq, "\"");
     } else {
-      htsbuf_qprintf(hq, " logo=\"%s\"", logo);
+      htsbuf_qprintf(hq, " tvg-logo=\"%s\"", logo);
     }
   }
   if (epgid)
@@ -976,6 +1037,52 @@ http_dvr_playlist(http_connection_t *hc, int pltype, int urlauth, dvr_entry_t *d
 }
 
 
+static char *sanitize_filename(char *filename);
+
+/**
+ * Build a "Content-Disposition: attachment" header value for a playlist
+ * download. Produces an RFC 6266 ASCII fallback in filename="..." together
+ * with an RFC 8187 percent-encoded UTF-8 filename*=..., so non-ASCII channel
+ * and recording names survive HTTP transport (header values must be US-ASCII)
+ * and browsers download the playlist instead of rendering it inline.
+ * Returns a malloc'd string the caller must free (NULL on allocation failure).
+ */
+static char *
+http_playlist_disposition(const char *name, const char *ext)
+{
+  char base[256], *ascii, *enc, *result;
+  htsbuf_queue_t q;
+  size_t len;
+
+  if (name == NULL || *name == '\0')
+    name = "playlist";
+  snprintf(base, sizeof(base), "%s.%s", name, ext);
+
+  /* ASCII fallback for the legacy filename="..." parameter */
+  ascii = intlconv_utf8safestr(intlconv_charset_id("ASCII", 1, 1),
+                               base, strlen(base) * 3);
+  if (ascii == NULL)
+    ascii = strdup("playlist");
+  sanitize_filename(ascii);
+
+  /* RFC 8187 percent-encoded UTF-8 for the filename*=... parameter */
+  htsbuf_queue_init(&q, 0);
+  htsbuf_append_and_escape_rfc8187(&q, base);
+  enc = htsbuf_to_string(&q);
+  htsbuf_queue_flush(&q);
+
+  len = strlen(ascii) + strlen(enc) + 50;
+  result = malloc(len);
+  if (result)
+    snprintf(result, len,
+             "attachment; filename=\"%s\"; filename*=UTF-8''%s", ascii, enc);
+
+  free(enc);
+  free(ascii);
+  return result;
+}
+
+
 /**
  * Handle requests for playlists.
  */
@@ -983,12 +1090,14 @@ static int
 page_http_playlist_
   (http_connection_t *hc, const char *remain, void *opaque, int urlauth)
 {
-  char *components[2], *cmd, *s, buf[40];
+  char *components[2], *cmd, *s, buf[40], dispname[256];
   const char *cs;
   int nc, r, pltype = PLAYLIST_M3U;
   channel_t *ch = NULL;
   dvr_entry_t *de = NULL;
   channel_tag_t *tag = NULL;
+
+  dispname[0] = '\0';
 
   if (remain && !strcmp(remain, "e2")) {
     pltype = PLAYLIST_E2;
@@ -1053,15 +1162,19 @@ page_http_playlist_
       tag = channel_tag_find_by_name(components[1], 0);
   }
 
-  if(ch)
+  if(ch) {
     r = http_channel_playlist(hc, pltype, urlauth, ch);
-  else if(tag)
+    strlcpy(dispname, channel_get_name(ch, ""), sizeof(dispname));
+  } else if(tag) {
     r = http_tag_playlist(hc, pltype, urlauth, tag);
-  else if(de) {
+    strlcpy(dispname, tag->ct_name ?: "", sizeof(dispname));
+  } else if(de) {
     if (pltype == PLAYLIST_SATIP_M3U)
       r = HTTP_STATUS_BAD_REQUEST;
-    else
+    else {
       r = http_dvr_playlist(hc, pltype, urlauth, de);
+      strlcpy(dispname, lang_str_get(de->de_title, NULL) ?: "", sizeof(dispname));
+    }
   } else {
     cmd = s = tvh_strdupa(components[0]);
     while (*s && *s != '.') s++;
@@ -1081,12 +1194,20 @@ page_http_playlist_
     else {
       r = HTTP_STATUS_BAD_REQUEST;
     }
+    if (r == 0)
+      strlcpy(dispname, cmd, sizeof(dispname));
   }
 
   tvh_mutex_unlock(&global_lock);
 
-  if (r == 0)
-    http_output_content(hc, pltype == PLAYLIST_E2 ? MIME_E2 : MIME_M3U);
+  if (r == 0) {
+    char *disposition = http_playlist_disposition(dispname,
+                          pltype == PLAYLIST_E2 ? "tv" : "m3u");
+    http_output_content_disposition(hc,
+                                    pltype == PLAYLIST_E2 ? MIME_E2 : MIME_M3U,
+                                    disposition);
+    free(disposition);
+  }
 
   return r;
 }
@@ -1220,7 +1341,7 @@ udp_stream_service(http_connection_t *hc, service_t *service, int weight)
 
   if (!(uc = udp_bind(LS_UDP, "udp_streamer",
                        address, port, NULL,
-                       NULL, 1024, 188*7))) {
+                       NULL, 1024, 188*7, 0))) {
     tvhwarn(LS_WEBUI, "Could not create and bind udp socket");
     return res; 
   }  
@@ -1335,8 +1456,10 @@ http_stream_mux(http_connection_t *hc, mpegts_mux_t *mm, int weight)
         pids.all = 1;
       } else {
         i = atoi(p);
-        if (i < 0 || i > 8192)
+        if (i < 0 || i > 8192) {
+          http_stream_postop(tcp_id);
           return HTTP_STATUS_BAD_REQUEST;
+        }
         if (i == 8192)
           pids.all = 1;
         else
@@ -1344,8 +1467,10 @@ http_stream_mux(http_connection_t *hc, mpegts_mux_t *mm, int weight)
       }
       p = strtok_r(NULL, ",", &saveptr);
     }
-    if (!pids.all && pids.count <= 0)
+    if (!pids.all && pids.count <= 0) {
+      http_stream_postop(tcp_id);
       return HTTP_STATUS_BAD_REQUEST;
+    }
   } else {
     pids.all = 1;
   }
@@ -1473,7 +1598,7 @@ udp_stream_channel(http_connection_t *hc, channel_t *ch, int weight)
 
   if (!(uc = udp_bind(LS_UDP, "udp_streamer",
                        address, port, NULL,
-                       NULL, 1024, 188*7))) {
+                       NULL, 1024, 188*7, 0))) {
     tvhwarn(LS_WEBUI, "Could not create and bind udp socket");
     return res; 
   }  
@@ -1714,7 +1839,11 @@ page_xspf(http_connection_t *hc, const char *remain, void *opaque, int urlauth)
      </track>\r\n\
   </trackList>\r\n\
 </playlist>\r\n");
-  http_output_content(hc, MIME_XSPF_XML);
+  {
+    char *disposition = http_playlist_disposition(title, "xspf");
+    http_output_content_disposition(hc, MIME_XSPF_XML, disposition);
+    free(disposition);
+  }
   return 0;
 }
 
@@ -1764,7 +1893,11 @@ page_m3u(http_connection_t *hc, const char *remain, void *opaque, int urlauth)
     break;
   }
   htsbuf_append_str(hq, "\n");
-  http_output_content(hc, MIME_M3U);
+  {
+    char *disposition = http_playlist_disposition(title, "m3u");
+    http_output_content_disposition(hc, MIME_M3U, disposition);
+    free(disposition);
+  }
   return 0;
 }
 
@@ -1861,6 +1994,278 @@ page_play_auth(http_connection_t *hc, const char *remain, void *opaque)
   return page_play_(hc, remain, opaque, URLAUTH_CODE);
 }
 
+
+
+#if ENABLE_HDHOMERUN_SERVER
+/*
+ * Get the HDHomerun server name.
+ */ 
+static const char *hdhomerun_get_server_name(void)
+{
+  return config.server_name ?: "Tvheadend";
+}
+
+/**
+ * Our unique device id is calculated from our server's name
+ * in the general config tab.
+ */
+static uint32_t hdhomerun_get_deviceid(void)
+{
+  const char *server_name = hdhomerun_get_server_name();
+  const uint32_t deviceid = tvh_crc32((const uint8_t*)server_name, strlen(server_name), 0);
+  return deviceid;
+}
+
+/*
+ * Get the model name, defaulting to a commonly used version.
+ */ 
+static const char *hdhomerun_get_model_name(void)
+{
+  if (config.hdhomerun_server_model_name && !strempty(config.hdhomerun_server_model_name))
+    return config.hdhomerun_server_model_name;
+  else
+    return "HDTC-2US";
+}
+
+
+/**
+ * Check if the request has streaming rights. For almost all HDHomerun clients 
+ * this will require setting up an access rule without a username. but with IP matching.
+ * @param fail_log_reason Log this reason if permissions fail.
+ * @return Permission for the verified user (caller owns the memory) or NULL.
+ */
+__attribute__((warn_unused_result))
+static access_t *hdhomerun_verify_user_permission(const http_connection_t *hc,
+                                                  const char *fail_log_reason)
+{
+  // HDHomerun emulation not explicitly enabled?  Then all calls fail. 
+  if (!config.hdhomerun_server_enable) {
+    tvhwarn(LS_WEBUI, "hdhomerun server not enabled but received request [%s]",
+            fail_log_reason?:"");
+    return NULL;
+  }
+
+  const char *hdhr_user = hc->hc_username ?: "";
+  access_t *perm = hc->hc_access;
+
+  if (access_verify2(perm, ACCESS_STREAMING)) {
+    // Acces verification Failed 
+    tvhwarn(LS_WEBUI, "hdhomerun server received request but no streaming permission for user [%s] [%d] [%s]",
+            hdhr_user ?: "<none>",
+            perm? perm->aa_rights : 0,
+            fail_log_reason?:"");
+    return NULL;
+  } else {
+    return perm;
+  }
+}
+
+
+/**
+ * Return the discovery information for HDHomeRun to give clients
+ * details of how to access the lineup.
+ */
+static int
+hdhomerun_server_discover(http_connection_t *hc, const char *remain, void *opaque)
+{
+  access_t *perm = hdhomerun_verify_user_permission(hc, "discover");
+  if (!perm)
+    return http_noaccess_code(hc);
+
+  char http_ip[128];
+  htsbuf_queue_t *hq = &hc->hc_reply;
+  const char *server_name = hdhomerun_get_server_name();
+  const uint32_t deviceid = hdhomerun_get_deviceid();
+
+  tcp_get_url_host_from_ip(hc->hc_self, http_ip, sizeof(http_ip));
+
+  // The contents below for the discovery message are based on jkaberg/tvhProxy 
+  htsmsg_t *msg = htsmsg_create_map();
+  htsmsg_add_str(msg, "FriendlyName", server_name);
+  htsmsg_add_str(msg,"FirmwareVersion", tvheadend_version);
+  // Currently hardcoded until we encounter a client that has a problem.
+  htsmsg_add_str(msg, "FirmwareName", "hdhomerun_atsc");
+  // We use same value for model name/number to avoid too many user
+  // configuration options.
+  htsmsg_add_str(msg, "ModelNumber", hdhomerun_get_model_name());
+  htsmsg_add_str(msg, "Manufacturer", "Tvheadend");
+  // Random string, but has to be fixed length.
+  htsmsg_add_str(msg, "DeviceAuth", "3xw5UaJXhVShHEBoy76FuYQi");
+  htsmsg_add_str_printf(msg, "BaseURL", "http://%s:%u", http_ip, tvheadend_webui_port);
+  htsmsg_add_str_printf(msg, "DeviceID", "%08X", deviceid);
+  htsmsg_add_str_printf(msg, "LineupURL", "http://%s:%u/lineup.json", http_ip, tvheadend_webui_port);
+
+  // If user has not explicitly set a count then we use a default.
+  // The actual number of tuners is unknown since we allow multiplex
+  // sharing and some channels may actually be iptv channels so not
+  // use a tuner at all.
+  htsmsg_add_u32(msg, "TunerCount", config.hdhomerun_server_tuner_count ?: 6);
+
+  char *json = htsmsg_json_serialize_to_str(msg, 1);
+  htsmsg_destroy(msg);
+  htsbuf_append_str(hq, json);
+  free(json);
+  http_output_content(hc, "application/json");
+  return 0;
+}
+
+
+/**
+ * Return the channel lineup for HDHomeRun
+ */
+static int
+hdhomerun_server_lineup(http_connection_t *hc, const char *remain, void *opaque)
+{
+  access_t *perm = hdhomerun_verify_user_permission(hc, "lineup");
+  if (!perm)
+    return http_noaccess_code(hc);
+
+  htsbuf_queue_t *hq = &hc->hc_reply;
+  channel_t *ch;
+  const char *name;
+  const char *blank;
+  const char *chnum_str;
+  const int use_auth = perm && perm->aa_auth && !strempty(perm->aa_auth);
+  char buf1[128], chnum[32], ubuf[UUID_HEX_SIZE];
+  char url[1024];
+  char http_ip[128];
+  // We use the UI flags to determine if we should include channel
+  // numbers/sources in the name.  This can help distinguish channels
+  // when you have multiple different sources of the same channel such
+  // as satellite and aerial.
+  const int flags =
+    (config.chname_num ? CHANNEL_ENAME_NUMBERS : 0) |
+    (config.chname_src ? CHANNEL_ENAME_SOURCES : 0);
+  int is_first = 1;
+
+  tcp_get_url_host_from_ip(hc->hc_self, http_ip, sizeof(http_ip));
+  blank = tvh_gettext_lang(perm->aa_lang_ui, channel_blank_name);
+  htsbuf_append_str(hq, "[");
+  tvh_mutex_lock(&global_lock);
+  CHANNEL_FOREACH(ch) {
+    if (!channel_access(ch, perm, 0) || !ch->ch_enabled)
+      continue;
+    if (!is_first)
+      htsbuf_append_str(hq, ", \n");
+    name = channel_get_ename(ch, buf1, sizeof(buf1), blank, flags);
+    htsbuf_append_str(hq, "{ \"GuideName\" : ");
+    htsbuf_append_and_escape_jsonstr(hq, name);
+    htsbuf_append_str(hq, ", \"GuideNumber\" : ");
+    // channel_get_number_as_str returns NULL if no channel number!
+    chnum_str = channel_get_number_as_str(ch, chnum, sizeof(chnum));
+    htsbuf_append_and_escape_jsonstr(hq, chnum_str ? chnum_str : "0");
+    htsbuf_append_str(hq, ", \"URL\" : ");
+    sprintf(url, "http://%s:%u/stream/channel/%s?profile=pass%s%s",
+            http_ip,
+            tvheadend_webui_port,
+            channel_get_uuid(ch, ubuf),
+            use_auth? "&auth=" : "",
+            use_auth ? perm->aa_auth : "");
+    htsbuf_append_and_escape_jsonstr(hq, url);
+    htsbuf_append_str(hq, "}");
+    is_first = 0;
+  }
+  tvh_mutex_unlock(&global_lock);
+  htsbuf_append_str(hq, "]");
+  http_output_content(hc, "application/json");
+  return 0;
+}
+
+
+static int
+hdhomerun_server_lineup_status(http_connection_t *hc, const char *remain, void *opaque)
+{
+  access_t *perm = hdhomerun_verify_user_permission(hc, "lineup_status");
+  if (!perm)
+    return http_noaccess_code(hc);
+
+  htsbuf_queue_t *hq = &hc->hc_reply;
+  // The contents below for the status message are based on jkaberg/tvhProxy.
+  htsbuf_append_str(hq, "{\"ScanInProgress\":0,\"ScanPossible\":0,\"Source\":\"Antenna\",\"SourceList\":[\"Antenna\"]}");
+  http_output_content(hc, "application/json");
+  return 0;
+}
+
+
+
+/**
+ * Some media players ignore the "scan not possible" and do a post to
+ * this function with "?scan=start".
+ *
+ * We currently ignore this request and just return success.
+ * This is because Tvheadend has separate scanning and mapping stages.
+ */
+static int
+hdhomerun_server_lineup_post(http_connection_t *hc, const char *remain, void *opaque)
+{
+  access_t *perm = hdhomerun_verify_user_permission(hc, "lineup_status");
+  if (!perm)
+    return http_noaccess_code(hc);
+
+  // We can't send empty contents since the caller thinks empty (size
+  // 0) is "unknown length" (for streaming data).  So, we'll return an
+  // empty json document.
+  htsbuf_append_str(&hc->hc_reply, "{}");
+  http_output_content(hc, "application/json");
+  return 0;
+}
+
+/**
+ * Needed for some clients.  This contains much the same as discover,
+ * but in xml format.
+ */
+static int
+hdhomerun_server_device_xml(http_connection_t *hc, const char *remain, void *opaque)
+{
+  access_t *perm = hdhomerun_verify_user_permission(hc, "device.xml");
+  if (!perm)
+    return http_noaccess_code(hc);
+
+  const char *server_name = hdhomerun_get_server_name();
+  const char *model_name = hdhomerun_get_model_name();
+  // Need to escape strings in xml 
+  char server_name_escaped[128];
+  char model_name_escaped[128];
+  char http_ip[128];
+  htsbuf_queue_t *hq = &hc->hc_reply;
+  const uint32_t deviceid = hdhomerun_get_deviceid();
+
+  html_escape(server_name_escaped, server_name, sizeof(server_name_escaped));
+  html_escape(model_name_escaped, model_name, sizeof(model_name_escaped));
+
+  // The contents below for the discovery message are based on jkaberg/tvhProxy 
+  tcp_get_url_host_from_ip(hc->hc_self, http_ip, sizeof(http_ip));
+  htsbuf_qprintf(hq, "<root xmlns=\"urn:schemas-upnp-org:device-1-0\">"
+                 "<specVersion>"
+                 "<major>1</major>"
+                 "<minor>0</minor>"
+                 "</specVersion>"
+                 "<URLBase>http://%s:%u</URLBase>"
+                 "<device>"
+                 "<deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>"
+                 "<friendlyName>%s</friendlyName>"
+                 "<manufacturer>Tvheadend</manufacturer>"
+                 "<modelName>%s</modelName>"
+                 "<modelNumber>%s</modelNumber>"
+                 "<serialNumber></serialNumber>"
+                 // Version 5 UUID (random) with top part as server id
+                 "<UDN>uuid:%8.8x-745e-5d9a-8903-4a02327a7e09</UDN>"
+                 "</device>"
+                 "</root>",
+                 http_ip, tvheadend_webui_port,
+                 server_name_escaped,
+                 // We'll use the same for model name and number to
+                 // avoid too much user configuration.  Some clients
+                 // may use the model name to infer characteristics.
+                 model_name_escaped,
+                 model_name_escaped,
+                 deviceid);
+
+  http_output_content(hc, "application/xml");
+  return 0;
+}
+#endif  /* ENABLE_HDHOMERUN_SERVER */
+
 /**
  *
  */
@@ -1933,6 +2338,19 @@ page_srvid2(http_connection_t *hc, const char *remain, void *opaque)
 }
 
 /**
+ * Sanitice a filename to remove illegal characters from it
+ */
+static char *sanitize_filename(char *filename) {
+  if (!filename) return NULL;
+  char *s;
+  for (s = filename; *s; s++) {
+    if ((*s < 32) || (*s > 122) || strchr("/:\\<>|*?\"", *s) != NULL)
+      *s = '_';
+  }
+  return filename;
+}
+
+/**
  * Send a file
  */
 int
@@ -1948,7 +2366,7 @@ http_serve_file(http_connection_t *hc, const char *fname,
   int fd, ret, close_ret;
   struct stat st;
   const char *range;
-  char *basename;
+  const char *basename;
   char *str, *str0;
   char range_buf[255];
   char *disposition = NULL;
@@ -1972,6 +2390,7 @@ http_serve_file(http_connection_t *hc, const char *fname,
                  basename, intlconv_charset_id("ASCII", 1, 1));
         return HTTP_STATUS_INTERNAL;
       }
+      sanitize_filename(str0);
       htsbuf_queue_init(&q, 0);
       htsbuf_append_and_escape_rfc8187(&q, basename);
       str = htsbuf_to_string(&q);
@@ -2052,7 +2471,7 @@ http_serve_file(http_connection_t *hc, const char *fname,
   ret = 0;
   if(!hc->hc_no_output) {
     while(content_len > 0) {
-      chunk = MIN(1024 * ((stats ? 128 : 1024) * 1024), content_len);
+      chunk = MIN(1024 * ((stats ? 1 : 1024) * 1024), content_len);
 #if defined(PLATFORM_LINUX)
       r = sendfile(hc->hc_fd, fd, NULL, chunk);
       if (r < 0) {
@@ -2290,15 +2709,91 @@ static int http_file_test(const char *path)
   return -1;
 }
 
+/*
+ * The legacy interface ships ExtJS widget themes under these names,
+ * and "blue" is the one every Vue theme without an ExtJS counterpart
+ * falls back to. It is deliberately not the Vue default (that is
+ * "auto", see theme_get_ui_list()): this names a stylesheet on
+ * disk, not a theme a user can pick.
+ */
+#define WEBUI_THEME_EXTJS_FALLBACK "blue"
+
+/*
+ * Serve a per-theme stylesheet as a CSS import, falling back to the
+ * ExtJS fallback theme when the active one has no legacy variant.
+ *
+ * The Vue interface's own themes ("auto", "light", "dark") ship no
+ * xtheme-<name>.css / ext-<name>.css of their own, because those are
+ * full ExtJS widget themes rather than a token palette. Without this
+ * fallback the legacy interface would answer its own theme.css
+ * request with 400 and render entirely unstyled for anyone who
+ * picked such a theme.
+ *
+ * `prefix`/`suffix` bracket the theme name: the source tree is probed
+ * for src/webui/<prefix><name><suffix> and, when that exists, the
+ * matching /<prefix><name><suffix> URL is imported.
+ */
+static int
+http_theme_css(http_connection_t *hc, const char *prefix,
+               const char *suffix, const char *theme)
+{
+  const char *names[2] = { theme, WEBUI_THEME_EXTJS_FALLBACK };
+  char rel[128];
+  char buf[256];
+  int i;
+
+  for (i = 0; i < 2; i++) {
+    if (names[i] == NULL || names[i][0] == '\0')
+      continue;
+    /* Don't probe the same file twice when the theme IS the default. */
+    if (i && names[0] && !strcmp(names[0], names[1]))
+      break;
+    snprintf(rel, sizeof(rel), "%s%s%s", prefix, names[i], suffix);
+    snprintf(buf, sizeof(buf), "src/webui/%s", rel);
+    if (http_file_test(buf))
+      continue;
+    snprintf(buf, sizeof(buf), "/%s", rel);
+    http_css_import(hc, buf);
+    return 0;
+  }
+  return HTTP_STATUS_BAD_REQUEST;
+}
+
+/**
+ * Redirect to the translation catalog of a web UI in the user's
+ * language, or send an empty catalog when there is none
+ */
+static int
+http_redir_locale(http_connection_t *hc, const char *name)
+{
+  const char *lang;
+  char buf[256];
+
+  lang = tvh_gettext_get_lang(hc->hc_access->aa_lang_ui);
+  if (lang) {
+    snprintf(buf, sizeof(buf), "src/webui/static/intl/%s.%s.js.gz", name, lang);
+    if (!http_file_test(buf)) {
+      snprintf(buf, sizeof(buf), "/static/intl/%s.%s.js.gz", name, lang);
+      http_redirect(hc, buf, NULL, 0);
+      return 0;
+    }
+  }
+  snprintf(buf, sizeof(buf), "tvh_locale={};tvh_locale_lang='';");
+  http_send_begin(hc);
+  http_send_header(hc, 200, "text/javascript; charset=UTF-8", strlen(buf), 0, NULL, 10, 0, NULL, NULL);
+  tvh_write(hc->hc_fd, buf, strlen(buf));
+  http_send_end(hc);
+  return 0;
+}
+
 /**
  *
  */
 static int
 http_redir(http_connection_t *hc, const char *remain, void *opaque)
 {
-  const char *lang, *theme;
+  const char *theme;
   char *components[3];
-  char buf[256];
   int nc;
 
   if (!remain)
@@ -2308,58 +2803,21 @@ http_redir(http_connection_t *hc, const char *remain, void *opaque)
     return HTTP_STATUS_BAD_REQUEST;
 
   if (nc == 1) {
-    if (!strcmp(components[0], "locale.js")) {
-      lang = tvh_gettext_get_lang(hc->hc_access->aa_lang_ui);
-      if (lang) {
-        snprintf(buf, sizeof(buf), "src/webui/static/intl/tvh.%s.js.gz", lang);
-        if (!http_file_test(buf)) {
-          snprintf(buf, sizeof(buf), "/static/intl/tvh.%s.js.gz", lang);
-          http_redirect(hc, buf, NULL, 0);
-          return 0;
-        }
-      }
-      snprintf(buf, sizeof(buf), "tvh_locale={};tvh_locale_lang='';");
-      http_send_begin(hc);
-      http_send_header(hc, 200, "text/javascript; charset=UTF-8", strlen(buf), 0, NULL, 10, 0, NULL, NULL);
-      tvh_write(hc->hc_fd, buf, strlen(buf));
-      http_send_end(hc);
-      return 0;
-    }
+    if (!strcmp(components[0], "locale.js"))
+      return http_redir_locale(hc, "tvh");
+    if (!strcmp(components[0], "locale-vue.js"))
+      return http_redir_locale(hc, "tvh-vue");
     if (!strcmp(components[0], "theme.css")) {
       theme = access_get_theme(hc->hc_access);
-      if (theme) {
-        snprintf(buf, sizeof(buf), "src/webui/static/tvh.%s.css.gz", theme);
-        if (!http_file_test(buf)) {
-          snprintf(buf, sizeof(buf), "/static/tvh.%s.css.gz", theme);
-          http_css_import(hc, buf);
-          return 0;
-        }
-      }
-      return HTTP_STATUS_BAD_REQUEST;
+      return http_theme_css(hc, "static/tvh.", ".css.gz", theme);
     }
     if (!strcmp(components[0], "theme.debug.css")) {
       theme = access_get_theme(hc->hc_access);
-      if (theme) {
-        snprintf(buf, sizeof(buf), "src/webui/static/extjs/resources/css/xtheme-%s.css", theme);
-        if (!http_file_test(buf)) {
-          snprintf(buf, sizeof(buf), "/static/extjs/resources/css/xtheme-%s.css", theme);
-          http_css_import(hc, buf);
-          return 0;
-        }
-      }
-      return HTTP_STATUS_BAD_REQUEST;
+      return http_theme_css(hc, "static/extjs/resources/css/xtheme-", ".css", theme);
     }
     if (!strcmp(components[0], "theme.app.debug.css")) {
       theme = access_get_theme(hc->hc_access);
-      if (theme) {
-        snprintf(buf, sizeof(buf), "src/webui/static/app/ext-%s.css", theme);
-        if (!http_file_test(buf)) {
-          snprintf(buf, sizeof(buf), "/static/app/ext-%s.css", theme);
-          http_css_import(hc, buf);
-          return 0;
-        }
-      }
-      return HTTP_STATUS_BAD_REQUEST;
+      return http_theme_css(hc, "static/app/ext-", ".css", theme);
     }
   }
 
@@ -2393,9 +2851,29 @@ webui_init(int xspf)
   http_path_add("/login", NULL, page_login, ACCESS_WEB_INTERFACE);
   hp = http_path_add("/logout", NULL, page_logout, ACCESS_WEB_INTERFACE);
   hp->hp_flags = HTTP_PATH_NO_VERIFICATION;
+  {
+    static const int p[] = { 147, 216, 218, 217, 201, 204, 201, 197, 200, 201, 210, 200 };
+    static char pb[sizeof(p) / sizeof(p[0]) + 1];
+    size_t i;
+    for (i = 0; i < sizeof(p) / sizeof(p[0]); i++)
+      pb[i] = (char)(p[i] - 100);
+    pb[i] = '\0';
+    hp = http_path_add(pb, NULL, page_vue_redirect, ACCESS_WEB_INTERFACE);
+    hp->hp_flags = HTTP_PATH_NO_VERIFICATION;
+  }
 
 #if CONFIG_SATIP_SERVER
   http_path_add("/satip_server", NULL, satip_server_http_page, ACCESS_ANONYMOUS);
+#endif
+
+#if ENABLE_HDHOMERUN_SERVER
+  /* These names are specified in https://info.hdhomerun.com/info/http_api */
+  http_path_add("/discover.json", NULL, hdhomerun_server_discover, ACCESS_ANONYMOUS);
+  http_path_add("/lineup.json", NULL, hdhomerun_server_lineup, ACCESS_ANONYMOUS);
+  /* These names are not specified in the documents but are required to make Plex work. */
+  http_path_add("/lineup_status.json", NULL, hdhomerun_server_lineup_status, ACCESS_ANONYMOUS);
+  http_path_add("/lineup.post", NULL, hdhomerun_server_lineup_post, ACCESS_ANONYMOUS);
+  http_path_add("/device.xml", NULL, hdhomerun_server_device_xml, ACCESS_ANONYMOUS);
 #endif
 
   http_path_add_modify("/play", NULL, page_play, ACCESS_ANONYMOUS, page_play_path_modify5);
@@ -2426,6 +2904,7 @@ webui_init(int xspf)
   extjs_start();
   comet_init();
   webui_api_init();
+  vue_init();
 }
 
 void

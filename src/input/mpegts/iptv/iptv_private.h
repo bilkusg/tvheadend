@@ -64,6 +64,7 @@ int  iptv_input_fd_started ( iptv_input_t *mi, iptv_mux_t *im );
 void iptv_input_close_fds ( iptv_input_t *mi, iptv_mux_t *im );
 void iptv_input_mux_started ( iptv_input_t *mi, iptv_mux_t *im, int reset );
 int  iptv_input_recv_packets ( iptv_mux_t *im, ssize_t len );
+int  iptv_input_pause_check ( iptv_mux_t *im );
 void iptv_input_recv_flush ( iptv_mux_t *im );
 void iptv_input_pause_handler ( iptv_input_t *mi, iptv_mux_t *im, int pause );
 
@@ -239,23 +240,6 @@ ssize_t iptv_rtp_read(iptv_mux_t *im, void (*pkt_cb)(iptv_mux_t *im, uint8_t *bu
 
 void iptv_input_unpause ( void *aux );
 
-struct rtsp_st {
-  // Note: input MUST BE FIRST in struct
-  streaming_target_t          input;      ///< Input source
-  streaming_target_t          *output;    ///< Output dest
-  streaming_target_t          *tsfix;
-  pthread_t                   st_thread;
-  volatile int                run;
-  volatile int                rtsp_input_start;
-  iptv_mux_t *im;
-};
-
-typedef struct rtsp_st rtsp_st_t;
-#if ENABLE_TIMESHIFT
-void *rtsp_status_thread(void *p) ;
-streaming_target_t* rtsp_st_create(streaming_target_t *out, profile_chain_t *prch);
-void rtsp_st_destroy(streaming_target_t *st);
-#endif
 #endif /* __IPTV_PRIVATE_H__ */
 
 /******************************************************************************
