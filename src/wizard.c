@@ -145,7 +145,7 @@ static void hello_changed(idnode_t *in)
 {
   wizard_page_t *p = (wizard_page_t *)in;
   wizard_hello_t *w = p->aux;
-  char buf[32];
+  char buf[64];
   size_t l = 0;
   int save = 0;
 
@@ -413,7 +413,7 @@ wizard_page_t *wizard_login(const char *lang)
       .id       = "network",
       .name     = N_("Allowed network"),
       .desc     = N_("Enter allowed network prefix(es). You can enter a "
-                     "comma-seperated list of prefixes here."),
+                     "comma-separated list of prefixes here."),
       .get      = wizard_get_value_network,
       .set      = wizard_set_value_network,
       .group    = 1
@@ -436,6 +436,7 @@ wizard_page_t *wizard_login(const char *lang)
       .desc     = N_("Enter an administrator password."),
       .get      = wizard_get_value_admin_password,
       .set      = wizard_set_value_admin_password,
+      .opts     = PO_PASSWORD,
       .group    = 2
     },
     {
@@ -454,6 +455,7 @@ wizard_page_t *wizard_login(const char *lang)
       .desc     = N_("Enter a non-admin user password."),
       .get      = wizard_get_value_password,
       .set      = wizard_set_value_password,
+      .opts     = PO_PASSWORD,
       .group    = 3
     },
     ICON(),
@@ -586,6 +588,7 @@ static void network_changed(idnode_t *in)
   .get  = network_get_value##num, \
   .set  = network_set_value##num, \
   .list = network_get_list##num, \
+  .opts = PO_LISTONLY, \
   .group = num, \
 }
 

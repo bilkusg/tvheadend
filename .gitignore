@@ -1,8 +1,8 @@
 build.*
 .config.mk
+node_modules/
 
 debian/debhelper-build-stamp
-filelist.txt
 
 src/version.c
 src/tvh_locale_inc.c
@@ -33,10 +33,13 @@ nbproject
 *.orig
 *.patch
 
+debian/.debhelper
 debian/changelog
 debian/files
 debian/tvheadend
 debian/tvheadend-dbg
+debian/tvheadend-armv6l
+debian/tvheadend-dbg-armv6l
 debian/tvheadend*substvars
 debian/tvheadend*.debhelper*
 
@@ -47,6 +50,7 @@ intl/tvheadend.en_CZ.po
 intl/*.new
 intl/js/tvheadend.js.en_CZ.po
 intl/js/*.new
+intl/vue/*.new
 src/webui/static/intl
 
 #############
@@ -59,3 +63,7 @@ Thumbs.db
 Desktop.ini
 #macOS files
 .DS_Store
+_codeql_detected_source_root
+
+# Claude Code local workspace (lock files, settings, etc.)
+.claude/

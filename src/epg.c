@@ -79,6 +79,22 @@ static int _ebc_start_cmp ( const void *a, const void *b )
   return ((epg_broadcast_t*)a)->start - ((epg_broadcast_t*)b)->start;
 }
 
+static int _ebc_xmltv_cmp ( const void *a, const void *b )
+{
+
+  //Sometimes, nulls are passed to this function and the strcmp() crashes.
+  if(!((epg_broadcast_t*)a)->xmltv_eid)
+  {
+    return -1;
+  }
+  if(!((epg_broadcast_t*)b)->xmltv_eid)
+  {
+    return 1;
+  }
+
+  return strcmp(((epg_broadcast_t*)a)->xmltv_eid, ((epg_broadcast_t*)b)->xmltv_eid);
+}
+
 void epg_updated ( void )
 {
   epg_object_t *eo;
@@ -109,7 +125,7 @@ void epg_updated ( void )
  * Object (Generic routines)
  * *************************************************************************/
 
-static void _epg_object_destroy 
+static void _epg_object_destroy
   ( epg_object_t *eo, epg_object_tree_t *tree )
 {
   assert(eo->refcount == 0);
@@ -475,7 +491,7 @@ int epg_channel_ignore_broadcast(channel_t *ch, time_t start)
   return 0;
 }
 
-static void _epg_channel_rem_broadcast 
+static void _epg_channel_rem_broadcast
   ( channel_t *ch, epg_broadcast_t *ebc, epg_broadcast_t *ebc_new )
 {
   RB_REMOVE(&ch->ch_epg_schedule, ebc, sched_link);
@@ -533,7 +549,7 @@ static void _epg_channel_timer_callback ( void *p )
     }
     break;
   }
-  
+
   /* Change (update HTSP) */
   if (cur != ch->ch_epg_now || nxt != ch->ch_epg_next) {
     tvhdebug(LS_EPG, "now/next %u/%u set on %s",
@@ -557,7 +573,7 @@ static void _epg_channel_timer_callback ( void *p )
   if (nxt) nxt->ops->putref(nxt);
 }
 
-static epg_broadcast_t *_epg_channel_add_broadcast 
+static epg_broadcast_t *_epg_channel_add_broadcast
   ( channel_t *ch, epg_broadcast_t **bcast, epggrab_module_t *src,
     int create, int *save, epg_changes_t *changed )
 {
@@ -579,11 +595,25 @@ static epg_broadcast_t *_epg_channel_add_broadcast
 
   /* Find (only) */
   if ( !create ) {
-    return RB_FIND(&ch->ch_epg_schedule, *bcast, sched_link, _ebc_start_cmp);
+    if((*bcast)->xmltv_eid)
+    {
+      return RB_FIND(&ch->ch_epg_schedule, *bcast, sched_link, _ebc_xmltv_cmp);
+    }
+    else
+    {
+      return RB_FIND(&ch->ch_epg_schedule, *bcast, sched_link, _ebc_start_cmp);
+    }
 
   /* Find/Create */
   } else {
-    ret = RB_INSERT_SORTED(&ch->ch_epg_schedule, *bcast, sched_link, _ebc_start_cmp);
+    if((*bcast)->xmltv_eid)
+    {
+      ret = RB_INSERT_SORTED(&ch->ch_epg_schedule, *bcast, sched_link, _ebc_xmltv_cmp);
+    }
+    else
+    {
+      ret = RB_INSERT_SORTED(&ch->ch_epg_schedule, *bcast, sched_link, _ebc_start_cmp);
+    }
 
     /* New */
     if (!ret) {
@@ -624,7 +654,7 @@ static epg_broadcast_t *_epg_channel_add_broadcast
       }
     }
   }
-  
+
   /* Changed */
   *save |= 1;
 
@@ -697,7 +727,7 @@ static epg_broadcast_t *_epg_channel_add_broadcast
   if (timer) _epg_channel_timer_callback(ch);
   if (ret->ops->putref(ret)) return NULL;
   return ret;
-}
+}// END _epg_channel_add_broadcast
 
 void epg_channel_unlink ( channel_t *ch )
 {
@@ -936,6 +966,40 @@ static epg_broadcast_t **_epg_broadcast_skel ( void )
   return &skel;
 }
 
+//Prepare an EPG struct to search for an extant event
+//using the XMLTV unique ID.
+epg_broadcast_t *epg_broadcast_find_by_xmltv_eid
+  ( channel_t *channel, epggrab_module_t *src,
+    time_t start, time_t stop, int create,
+    int *save, epg_changes_t *changed, const char *xmltv_eid)
+{
+  epg_broadcast_t **ebc;
+  int             ret = 0;
+  if (!channel || !start || !stop || !xmltv_eid) return NULL;
+  if (stop <= start) return NULL;
+  if (stop <= gclk()) return NULL;
+
+  ebc = _epg_broadcast_skel();
+  (*ebc)->start         = start;
+  (*ebc)->stop          = stop;
+
+  if((*ebc)->xmltv_eid)
+  {
+    free((*ebc)->xmltv_eid);
+    (*ebc)->xmltv_eid     = NULL;
+  }
+  
+  ret = epg_broadcast_set_xmltv_eid(*ebc, xmltv_eid, changed);
+
+  //If the XMLTV ID was not set, exit.
+  if(!ret){
+    tvherror(LS_EPG, "Unable to set '%s' result '%d'", xmltv_eid, ret);
+    return NULL;
+  }
+
+  return _epg_channel_add_broadcast(channel, ebc, src, create, save, changed);
+}
+
 epg_broadcast_t *epg_broadcast_find_by_time
   ( channel_t *channel, epggrab_module_t *src,
     time_t start, time_t stop, int create, int *save, epg_changes_t *changed )
@@ -948,6 +1012,7 @@ epg_broadcast_t *epg_broadcast_find_by_time
   ebc = _epg_broadcast_skel();
   (*ebc)->start   = start;
   (*ebc)->stop    = stop;
+  (*ebc)->xmltv_eid = NULL;
 
   return _epg_channel_add_broadcast(channel, ebc, src, create, save, changed);
 }
@@ -963,7 +1028,10 @@ int epg_broadcast_change_finish
   if (!(changes & EPG_CHANGED_EPISODE))
     save |= epg_broadcast_set_episodelink_uri(broadcast, NULL, NULL);
   if (!(changes & EPG_CHANGED_DVB_EID))
-    save |= epg_broadcast_set_dvb_eid(broadcast, 0, NULL);
+    {
+      save |= epg_broadcast_set_dvb_eid(broadcast, 0, NULL);
+      save |= epg_broadcast_set_xmltv_eid(broadcast, NULL, NULL);
+    }
   if (!(changes & EPG_CHANGED_IS_WIDESCREEN))
     save |= epg_broadcast_set_is_widescreen(broadcast, 0, NULL);
   if (!(changes & EPG_CHANGED_IS_HD))
@@ -988,6 +1056,8 @@ int epg_broadcast_change_finish
     save |= epg_broadcast_set_star_rating(broadcast, 0, NULL);
   if (!(changes & EPG_CHANGED_AGE_RATING))
     save |= epg_broadcast_set_age_rating(broadcast, 0, NULL);
+  if (!(changes & EPG_CHANGED_RATING_LABEL))
+    save |= epg_broadcast_set_rating_label(broadcast, 0, NULL);
   if (!(changes & EPG_CHANGED_IMAGE))
     save |= epg_broadcast_set_image(broadcast, NULL, NULL);
   if (!(changes & EPG_CHANGED_GENRE))
@@ -1039,6 +1109,7 @@ epg_broadcast_t *epg_broadcast_clone
                                    1, save, &changes);
   if (ebc) {
     /* Copy metadata */
+    *save |= epg_broadcast_set_xmltv_eid(ebc, src->xmltv_eid, &changes);
     *save |= epg_broadcast_set_is_widescreen(ebc, src->is_widescreen, &changes);
     *save |= epg_broadcast_set_is_hd(ebc, src->is_hd, &changes);
     *save |= epg_broadcast_set_is_bw(ebc, src->is_bw, &changes);
@@ -1051,6 +1122,7 @@ epg_broadcast_t *epg_broadcast_clone
     *save |= epg_broadcast_set_is_repeat(ebc, src->is_repeat, &changes);
     *save |= epg_broadcast_set_star_rating(ebc, src->star_rating, &changes);
     *save |= epg_broadcast_set_age_rating(ebc, src->age_rating, &changes);
+    *save |= epg_broadcast_set_rating_label(ebc, src->rating_label, &changes);
     *save |= epg_broadcast_set_image(ebc, src->image, &changes);
     *save |= epg_broadcast_set_genre(ebc, &src->genre, &changes);
     *save |= epg_broadcast_set_title(ebc, src->title, &changes);
@@ -1138,6 +1210,17 @@ int epg_broadcast_set_dvb_eid
   if (!b) return 0;
   return _epg_object_set_u16(b, &b->dvb_eid, dvb_eid,
                              changed, EPG_CHANGED_DVB_EID);
+}
+
+int epg_broadcast_set_xmltv_eid
+  ( epg_broadcast_t *b, const char *xmltv_eid, epg_changes_t *changed )
+{
+  int save;
+  if (!b) return 0;
+  save = _epg_object_set_str(b, &b->xmltv_eid, xmltv_eid,
+                             changed, EPG_CHANGED_DVB_EID);
+
+  return save;
 }
 
 int epg_broadcast_set_is_widescreen
@@ -1334,8 +1417,25 @@ int epg_broadcast_set_image
   save = _epg_object_set_str(b, &b->image, image,
                              changed, EPG_CHANGED_IMAGE);
   if (save)
-    imagecache_get_id(image);
+    imagecache_get_id_prio(image, (int64_t)b->start);
   return save;
+}
+
+/*
+ * Register every broadcast's image at its airing time, as loading the EPG at
+ * start-up does.  Used after an image cache clean, so the refill starts with
+ * the soonest-airing artwork instead of waiting for a client to walk the guide.
+ */
+void epg_broadcast_images_register ( void )
+{
+  channel_t *ch;
+  epg_broadcast_t *b;
+
+  lock_assert(&global_lock);
+  CHANNEL_FOREACH(ch)
+    RB_FOREACH(b, &ch->ch_epg_schedule, sched_link)
+      if (!strempty(b->image))
+        imagecache_get_id_prio(b->image, (int64_t)b->start);
 }
 
 int epg_broadcast_set_epnumber
@@ -1396,25 +1496,38 @@ int epg_broadcast_set_genre
   ( epg_broadcast_t *b, epg_genre_list_t *genre, epg_changes_t *changed )
 {
   int save = 0;
-  epg_genre_t *g1, *g2;
+  epg_genre_t *g1, *g2, *last = NULL;
 
   if (!b) return 0;
 
   if (changed) *changed |= EPG_CHANGED_GENRE;
 
-  g1 = LIST_FIRST(&b->genre);
+  /* Its own list: nothing to change, and it must not be emptied below
+   * while it is searched */
+  if (genre == &b->genre) return 0;
 
-  /* Remove old */
+  g1 = LIST_FIRST(&b->genre);
+  LIST_INIT(&b->genre);
+
+  /* Remove old: relink the entries still wanted, in order, and free the
+   * others.  Same result as unlinking them in place, but the list head is
+   * rewritten explicitly: static analysers do not follow LIST_REMOVE()
+   * updating it through le_prev, and took the head for a freed entry. */
   while (g1) {
     g2 = LIST_NEXT(g1, link);
-    if (!epg_genre_list_contains(genre, g1, 0)) {
-      LIST_REMOVE(g1, link);
+    if (epg_genre_list_contains(genre, g1, 0)) {
+      if (last)
+        LIST_INSERT_AFTER(last, g1, link);
+      else
+        LIST_INSERT_HEAD(&b->genre, g1, link);
+      last = g1;
+    } else {
       free(g1);
       save = 1;
     }
     g1 = g2;
   }
-  
+
   /* Insert all entries */
   if (genre) {
     LIST_FOREACH(g1, genre, link)
@@ -1438,6 +1551,20 @@ int epg_broadcast_set_age_rating
   if (!b) return 0;
   return _epg_object_set_u8(b, &b->age_rating, age,
                             changed, EPG_CHANGED_AGE_RATING);
+}
+
+int epg_broadcast_set_rating_label
+  ( epg_broadcast_t *b, ratinglabel_t *rating_label, epg_changes_t *changed )
+{
+  if (!b || !rating_label) return 0;
+
+  if(rating_label != b->rating_label){
+    b->rating_label = rating_label;
+    if (changed) *changed |= EPG_CHANGED_RATING_LABEL;
+    return 1;
+  }
+
+  return 0;
 }
 
 int epg_broadcast_set_first_aired
@@ -1476,6 +1603,11 @@ const char *epg_broadcast_get_subtitle ( epg_broadcast_t *b, const char *lang )
   if (!b || !b->subtitle) return NULL;
   return lang_str_get(b->subtitle, lang);
 }
+const ratinglabel_t *epg_broadcast_get_rating_label ( epg_broadcast_t *b )
+{
+  if (!b || !b->rating_label) return NULL;
+  return b->rating_label;
+}
 
 const char *epg_broadcast_get_summary ( epg_broadcast_t *b, const char *lang )
 {
@@ -1500,6 +1632,78 @@ const char *epg_broadcast_get_description ( epg_broadcast_t *b, const char *lang
   if (!b || !b->description) return NULL;
   return lang_str_get(b->description, lang);
 }
+
+/**
+ * Take all of the string fields from an EPG record and concatenate
+ * them into a monolithic merged string.
+ *
+ * Used for Autorec creation and interactive EPG search.
+ *
+ * [0x01]<TITLE_LANG1>[0x09]<TITLE_TEXT1>[0x09]<TITLE_LANG2><TITLE_TEXT2>[0x02]<SHORT_DESC_LANG1>[0x09]<SHORT_DESC_TEXT1>[0x09]<SHORT_DESC_LANG2>[0x09]<SHORT_DESCT_EXT2>[0x03][0x04][0x05][0x06][0x07]
+ *
+ * 0x01 = Title
+ * 0x02 = Subtitle (Short Description)
+ * 0x03 = Summary
+ * 0x04 = Description
+ * 0x05 = Credits
+ * 0x06 = Keywords
+ * 0x07 = Terminator
+ *
+ * 0x09 = Field separator (Tab)
+ * 
+ */
+char* epg_broadcast_get_merged_text ( epg_broadcast_t *b )
+{
+
+  if (!b) return NULL;
+
+  size_t            string_size = 8;  //Allow for a field mark for each field, even if null.
+  lang_str_ele_t    *ls;
+  char              *mergedtext = NULL;
+  size_t            output_pos = 0;
+
+  lang_str_t *fields[] = {
+    b->title, b->subtitle, b->summary, b->description, b->credits_cached, b->keyword_cached
+  };
+
+  //First work out the concatenated string length
+  int i = 0;  //Some older compiler versions don't like the variable declaration at the start of the for loop.
+  for (i = 0; i < 6; i++) {
+    if (fields[i]) {
+      RB_FOREACH(ls, fields[i], link) {
+        string_size += strlen(ls->str) + strlen(ls->lang) + 2; // 2 separators
+      }
+    }
+  }
+
+  //Now allocate a string big enough to hold the merged EPG fields.
+  mergedtext = calloc(string_size, 1);
+  if (!mergedtext) {
+    tvhinfo(LS_EPG, "Unable to allocate string size '%zu' for merged text search.  Skipping search.", string_size);
+    return NULL;
+  }
+
+  //Concatenate all of the EPG strings.
+  for (i = 0; i < 6; i++) {
+    mergedtext[output_pos++] = i + 1; // Field codes 0x01 to 0x06
+    if (fields[i]) {
+      RB_FOREACH(ls, fields[i], link) {
+        mergedtext[output_pos++] = 0x09;
+        size_t lang_len = strlen(ls->lang);
+        memcpy(mergedtext + output_pos, ls->lang, lang_len);
+        output_pos += lang_len;
+        mergedtext[output_pos++] = 0x09;
+        size_t str_len = strlen(ls->str);
+        memcpy(mergedtext + output_pos, ls->str, str_len);
+        output_pos += str_len;
+      }
+    }
+  }
+
+  mergedtext[output_pos++] = 0x07; //Add a terminator
+
+  return mergedtext;
+}//END epg_broadcast_get_merged_text
 
 void epg_broadcast_get_epnum ( const epg_broadcast_t *b, epg_episode_num_t *num )
 {
@@ -1537,6 +1741,8 @@ htsmsg_t *epg_broadcast_serialize ( epg_broadcast_t *broadcast )
     htsmsg_add_str(m, "ch", channel_get_uuid(broadcast->channel, ubuf));
   if (broadcast->dvb_eid)
     htsmsg_add_u32(m, "eid", broadcast->dvb_eid);
+  if (broadcast->xmltv_eid)
+    htsmsg_add_str(m, "xeid", broadcast->xmltv_eid);
   if (broadcast->is_widescreen)
     htsmsg_add_u32(m, "is_wd", 1);
   if (broadcast->is_hd)
@@ -1561,6 +1767,10 @@ htsmsg_t *epg_broadcast_serialize ( epg_broadcast_t *broadcast )
     htsmsg_add_u32(m, "star", broadcast->star_rating);
   if (broadcast->age_rating)
     htsmsg_add_u32(m, "age", broadcast->age_rating);
+  if (broadcast->rating_label)
+    {
+      htsmsg_add_str(m, "ratlab", idnode_uuid_as_str((idnode_t *)(broadcast->rating_label), ubuf));
+    }
   if (broadcast->image)
     htsmsg_add_str(m, "img", broadcast->image);
   if (broadcast->title)
@@ -1637,6 +1847,8 @@ epg_broadcast_t *epg_broadcast_deserialize
   /* Get metadata */
   if (!htsmsg_get_u32(m, "eid", &eid))
     *save |= epg_broadcast_set_dvb_eid(ebc, eid, &changes);
+  if ((str = htsmsg_get_str(m, "xeid")))
+    *save |= epg_broadcast_set_xmltv_eid(ebc, str, &changes);
   if (!htsmsg_get_u32(m, "is_wd", &u32))
     *save |= epg_broadcast_set_is_widescreen(ebc, u32, &changes);
   if (!htsmsg_get_u32(m, "is_hd", &u32))
@@ -1661,6 +1873,12 @@ epg_broadcast_t *epg_broadcast_deserialize
     *save |= epg_broadcast_set_star_rating(ebc, u32, &changes);
   if (!htsmsg_get_u32(m, "age", &u32))
     *save |= epg_broadcast_set_age_rating(ebc, u32, &changes);
+  if ((str = htsmsg_get_str(m, "ratlab")))
+  {
+    //Convert the UUID string saved on disk into an idnode ID
+    //and then fetch the ratinglabel object.
+    *save |= epg_broadcast_set_rating_label(ebc, ratinglabel_find_from_uuid(str), &changes);
+  }
 
   if ((str = htsmsg_get_str(m, "img")))
     *save |= epg_broadcast_set_image(ebc, str, &changes);
@@ -2010,7 +2228,7 @@ int epg_genre_list_add ( epg_genre_list_t *list, epg_genre_t *genre )
     LIST_INSERT_HEAD(list, g2, link);
   } else {
     while (g1) {
-    
+
       /* Already exists */
       if (g1->code == genre->code) return 0;
 
@@ -2059,7 +2277,7 @@ int epg_genre_list_add_by_str ( epg_genre_list_t *list, const char *str, const c
 
 // Note: if partial=1 and genre is a major only category then all minor
 // entries will also match
-int epg_genre_list_contains 
+int epg_genre_list_contains
   ( epg_genre_list_t *list, epg_genre_t *genre, int partial )
 {
   uint8_t mask = 0xFF;
@@ -2138,6 +2356,9 @@ _eq_add ( epg_query_t *eq, epg_broadcast_t *e )
 {
   const char *s, *lang = eq->lang;
   int fulltext = eq->stitle && eq->fulltext;
+  int mergetext = eq->stitle && eq->mergetext;
+  char    *mergedtext = NULL;
+  int     mergedtextResult = 0;
 
   /* Filtering */
   if (e == NULL) return;
@@ -2192,7 +2413,25 @@ _eq_add ( epg_query_t *eq, epg_broadcast_t *e )
     if (!e->is_new)
       return;
   }
-  if (fulltext) {
+  
+  //Search EPG text fields concatenated into one huge string.
+  if(mergetext)
+  {
+    mergedtextResult = 0;
+    mergedtext = epg_broadcast_get_merged_text(e);
+    if(mergedtext)
+    {
+      mergedtextResult = regex_match(&eq->stitle_re, mergedtext);
+      free(mergedtext);
+      if(mergedtextResult)
+      {
+        return;
+      }
+    }
+  }//END mergetext
+
+  //A mergetext search takes priority over a fulltext search.
+  if (fulltext && !mergetext) {
     if ((s = epg_broadcast_get_title(e, lang)) == NULL ||
         regex_match(&eq->stitle_re, s)) {
       if ((s = epg_broadcast_get_subtitle(e, lang)) == NULL ||
@@ -2212,10 +2451,11 @@ _eq_add ( epg_query_t *eq, epg_broadcast_t *e )
         }
       }
     }
-  }
-  if (eq->title.comp != EC_NO || (eq->stitle && !fulltext)) {
+  }//END fulltext    
+
+  if (eq->title.comp != EC_NO || (eq->stitle && !(fulltext || mergetext))) {
     if ((s = epg_broadcast_get_title(e, lang)) == NULL) return;
-    if (eq->stitle && !fulltext && regex_match(&eq->stitle_re, s)) return;
+    if (eq->stitle && !(fulltext || mergetext) && regex_match(&eq->stitle_re, s)) return;
     if (eq->title.comp != EC_NO && _eq_comp_str(&eq->title, s)) return;
   }
   if (eq->subtitle.comp != EC_NO) {
@@ -2396,21 +2636,21 @@ static int _epg_sort_channel_ascending ( const void *a, const void *b, void *eq 
 
 static int _epg_sort_channel_descending ( const void *a, const void *b, void *eq )
 {
-  return _epg_sort_description_ascending(a, b, eq) * -1;
+  return _epg_sort_channel_ascending(a, b, eq) * -1;
 }
 
 static int _epg_sort_channel_num_ascending ( const void *a, const void *b, void *eq )
 {
   int64_t v1 = channel_get_number((*(epg_broadcast_t**)a)->channel);
   int64_t v2 = channel_get_number((*(epg_broadcast_t**)b)->channel);
-  return v1 - v2;
+  return (v1 > v2) - (v1 < v2);
 }
 
 static int _epg_sort_channel_num_descending ( const void *a, const void *b, void *eq )
 {
   const int64_t v1 = channel_get_number((*(epg_broadcast_t**)a)->channel);
   const int64_t v2 = channel_get_number((*(epg_broadcast_t**)b)->channel);
-  return v2 - v1;
+  return (v2 > v1) - (v2 < v1);
 }
 
 static int _epg_sort_stars_ascending ( const void *a, const void *b, void *eq )
@@ -2487,7 +2727,7 @@ epg_query ( epg_query_t *eq, access_t *perm )
   if (channel && tag == NULL) {
     if (channel_access(channel, perm, 0))
       _eq_add_channel(eq, channel);
-  
+
   /* Tag based */
   } else if (tag) {
     idnode_list_mapping_t *ilm;
