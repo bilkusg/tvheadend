@@ -17,7 +17,10 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#define _GNU_SOURCE
 #include <sys/stat.h>
+#include <strings.h>
+#include <unistd.h>
 
 #include "settings.h"
 
@@ -132,6 +135,36 @@ dvr_config_find_by_list(htsmsg_t *uuids, const char *name)
  *
  */
 static int
+dvr_charset_is_ascii(const char *s)
+{
+  return s && (strcasecmp(s, "ASCII") == 0 ||
+               strcasecmp(s, "US-ASCII") == 0 ||
+               strcasecmp(s, "ANSI_X3.4-1968") == 0);
+}
+
+/*
+ * The charset a new configuration starts with.  Converting to ASCII
+ * without transliteration replaces every non-ASCII character with the
+ * same substitute, which makes unreadable and colliding file names, so
+ * use UTF-8 there.  A charset the user picks is left alone.
+ */
+static const char *
+dvr_default_charset(htsmsg_t *conf)
+{
+  const char *s = intlconv_filesystem_charset();
+
+  if (dvr_charset_is_ascii(s) && !intlconv_translit_supported()) {
+    /* Stay quiet when a saved or submitted charset replaces this. */
+    if (conf == NULL || htsmsg_get_str(conf, "charset") == NULL)
+      tvhinfo(LS_DVR, "iconv() cannot transliterate, using UTF-8 "
+                      "rather than %s for file names", s);
+    /* Not NULL, dvr_charset_update() would turn that back into s. */
+    return "UTF-8";
+  }
+  return s;
+}
+
+static int
 dvr_charset_update(dvr_config_t *cfg, const char *charset)
 {
   const char *s, *id;
@@ -175,10 +208,12 @@ dvr_config_create(const char *name, const char *uuid, htsmsg_t *conf)
   cfg->dvr_config_name = strdup(name);
   cfg->dvr_retention_days = DVR_RET_ONREMOVE;
   cfg->dvr_removal_days = DVR_RET_REM_FOREVER;
+  cfg->dvr_max_data_errors = DVR_MAX_DATA_ERRORS;
   cfg->dvr_clone = 1;
   cfg->dvr_tag_files = 1;
+  cfg->dvr_create_scene_markers = 1;
   cfg->dvr_skip_commercials = 1;
-  dvr_charset_update(cfg, intlconv_filesystem_charset());
+  dvr_charset_update(cfg, dvr_default_charset(conf));
   cfg->dvr_warm_time = 30;
   cfg->dvr_update_window = 24 * 3600;
   cfg->dvr_pathname = strdup("$t$n.$x");
@@ -187,6 +222,7 @@ dvr_config_create(const char *name, const char *uuid, htsmsg_t *conf)
   cfg->dvr_autorec_max_count = 50;
   cfg->dvr_format_tvmovies_subdir = strdup("tvmovies");
   cfg->dvr_format_tvshows_subdir = strdup("tvshows");
+  cfg->dvr_autorec_dedup = DVR_AUTOREC_RECORD_ALL;
 
   /* Muxer config */
   cfg->dvr_muxcnf.m_cache  = MC_CACHE_SYSTEM;
@@ -273,27 +309,44 @@ dvr_config_destroy(dvr_config_t *cfg, int delconf)
 static void
 dvr_config_storage_check(dvr_config_t *cfg)
 {
+  char recordings_dir[] = "/var/lib/tvheadend/recordings";
+  char home_dir[PATH_MAX + sizeof("/Videos")];
+  char dvr_dir[PATH_MAX];
   char buf[PATH_MAX];
+  uid_t uid = getuid();
+  char *xdg_dir;
   struct stat st;
-  const char *homedir;
 
   if(cfg->dvr_storage != NULL && cfg->dvr_storage[0])
     return;
 
   /* Try to figure out a good place to put them videos */
+  snprintf(home_dir, sizeof(home_dir), "%s/Videos", getenv("HOME"));
+  xdg_dir = hts_settings_get_xdg_dir_with_fallback("VIDEOS", home_dir);
+  if (xdg_dir != NULL) {
+    if (stat(xdg_dir, &st) == 0) {
+      if (S_ISLNK(st.st_mode)) {
+        char xdg_dir_link[PATH_MAX - sizeof('\0')];
 
-  homedir = getenv("HOME");
-
-  if(homedir != NULL) {
-    snprintf(buf, sizeof(buf), "%s/Videos", homedir);
-    if(stat(buf, &st) == 0 && S_ISDIR(st.st_mode))
-      cfg->dvr_storage = strdup(buf);
-
-    else if(stat(homedir, &st) == 0 && S_ISDIR(st.st_mode))
-      cfg->dvr_storage = strdup(homedir);
-    else
-      cfg->dvr_storage = strdup(getcwd(buf, sizeof(buf)));
+        if (readlink(xdg_dir, xdg_dir_link, sizeof(xdg_dir_link)) == -1)
+          tvhwarn(LS_DVR, "symlink '%s' error: %s\n", xdg_dir, strerror(errno));
+        else
+          strncpy(dvr_dir, xdg_dir_link, sizeof(dvr_dir));
+      } else if (S_ISDIR(st.st_mode)) {
+        strncpy(dvr_dir, xdg_dir, sizeof(dvr_dir) - sizeof('\0'));
+      }
+    }
+    free(xdg_dir);
   }
+
+  if ((stat(recordings_dir, &st) == 0) && (st.st_uid == uid))
+    cfg->dvr_storage = strndup(recordings_dir, sizeof(recordings_dir));
+  else if((stat(dvr_dir, &st) == 0) && S_ISDIR(st.st_mode))
+      cfg->dvr_storage = strndup(dvr_dir, PATH_MAX);
+  else if(stat(home_dir, &st) == 0 && S_ISDIR(st.st_mode))
+      cfg->dvr_storage = strndup(home_dir, sizeof(home_dir));
+  else
+      cfg->dvr_storage = strdup(getcwd(buf, sizeof(buf)));
 
   tvhwarn(LS_DVR,
           "Output directory for video recording is not yet configured "
@@ -822,6 +875,44 @@ dvr_config_entry_class_update_window_list(void *o, const char *lang)
            24*3600, 60, lang);
 }
 
+static htsmsg_t *
+dvr_autorec_entry_class_record_list ( void *o, const char *lang )
+{
+  static const struct strtab tab[] = {
+    { N_("Record all"),
+        DVR_AUTOREC_RECORD_ALL },
+    { N_("All: Record if EPG/XMLTV indicates it is a unique programme"),
+        DVR_AUTOREC_RECORD_UNIQUE },
+    { N_("All: Record if different episode number"),
+        DVR_AUTOREC_RECORD_DIFFERENT_EPISODE_NUMBER },
+    { N_("All: Record if different subtitle"),
+        DVR_AUTOREC_RECORD_DIFFERENT_SUBTITLE },
+    { N_("All: Record if different description"),
+        DVR_AUTOREC_RECORD_DIFFERENT_DESCRIPTION },
+    { N_("All: Record once per month"),
+        DVR_AUTOREC_RECORD_ONCE_PER_MONTH },
+    { N_("All: Record once per week"),
+        DVR_AUTOREC_RECORD_ONCE_PER_WEEK },
+    { N_("All: Record once per day"),
+        DVR_AUTOREC_RECORD_ONCE_PER_DAY },
+    { N_("Local: Record if different episode number"),
+        DVR_AUTOREC_LRECORD_DIFFERENT_EPISODE_NUMBER },
+    { N_("Local: Record if different title"),
+        DVR_AUTOREC_LRECORD_DIFFERENT_TITLE },
+    { N_("Local: Record if different subtitle"),
+        DVR_AUTOREC_LRECORD_DIFFERENT_SUBTITLE },
+    { N_("Local: Record if different description"),
+        DVR_AUTOREC_LRECORD_DIFFERENT_DESCRIPTION },
+    { N_("Local: Record once per month"),
+        DVR_AUTOREC_LRECORD_ONCE_PER_MONTH },
+    { N_("Local: Record once per week"),
+        DVR_AUTOREC_LRECORD_ONCE_PER_WEEK },
+    { N_("Local: Record once per day"),
+        DVR_AUTOREC_LRECORD_ONCE_PER_DAY },
+  };
+  return strtab2htsmsg(tab, 1, lang);
+}
+
 static int
 dvr_config_class_pathname_set(void *o, const void *v)
 {
@@ -847,6 +938,7 @@ PROP_DOC(dvrconfig_whitespace)
 PROP_DOC(dvrconfig_unsafe)
 PROP_DOC(dvrconfig_windows)
 PROP_DOC(dvrconfig_fanart)
+PROP_DOC(duplicate_handling)
 
 const idclass_t dvr_config_class = {
   .ic_class      = "dvrconfig",
@@ -1032,6 +1124,18 @@ const idclass_t dvr_config_class = {
                      "schedule a re-record (if possible)."),
       .off      = offsetof(dvr_config_t, dvr_rerecord_errors),
       .opts     = PO_ADVANCED,
+      .group    = 1,
+    },
+    {
+      .type     = PT_U32,
+      .id       = "data-error-threshold",
+      .name     = N_("Data error threshold for failed recordings (0=off)"),
+      .desc     = N_("If a completed recording has this many or more data "
+                     "errors, mark it as failed. Set to 0 to disable this "
+                     "check."),
+      .off      = offsetof(dvr_config_t, dvr_max_data_errors),
+      .opts     = PO_ADVANCED,
+      .def.u32  = DVR_MAX_DATA_ERRORS,
       .group    = 1,
     },
     {
@@ -1359,6 +1463,16 @@ const idclass_t dvr_config_class = {
       .group    = 5,
     },
     {
+      .type     = PT_BOOL,
+      .id       = "create-scene-markers",
+      .name     = N_("Create scene markers"),
+      .desc     = N_("Create scene markers in recordings "
+                     "based on the EPG start/stop times when available."),
+      .off      = offsetof(dvr_config_t, dvr_create_scene_markers),
+      .def.i    = 1,
+      .group    = 5,
+    },
+    {
       .type     = PT_U32,
       .id       = "epg-update-window",
       .name     = N_("EPG update window"),
@@ -1400,6 +1514,18 @@ const idclass_t dvr_config_class = {
       .desc     = N_("The maximum number of recordings that can be scheduled."),
       .off      = offsetof(dvr_config_t, dvr_autorec_max_sched_count),
       .opts     = PO_ADVANCED,
+      .group    = 6,
+    },
+    {
+      .type     = PT_U32,
+      .id       = "record",
+      .name     = N_("Duplicate handling"),
+      .desc     = N_("How to handle duplicate recordings."),
+      .def.i    = DVR_AUTOREC_RECORD_ALL,
+      .doc      = prop_doc_duplicate_handling,
+      .off      = offsetof(dvr_config_t, dvr_autorec_dedup),
+      .list     = dvr_autorec_entry_class_record_list,
+      .opts     = PO_ADVANCED | PO_DOC_NLIST | PO_HIDDEN,
       .group    = 6,
     },
     {

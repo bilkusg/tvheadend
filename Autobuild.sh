@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Entry point for the Doozer autobuild system
+# Entry point for the autobuild system
 #
 # (c) Andreas Öman 2011. All rights reserved.
 #
@@ -16,7 +16,7 @@ TARGET=""
 ARCHOVR=""
 RELEASE="--release"
 WORKINGDIR="/var/tmp/showtime-autobuild"
-FILELIST="$PWD/filelist.txt"
+
 OP="build"
 OSPREFIX=""
 
@@ -48,8 +48,8 @@ do
 	  ARCHOVR="$OPTARG"
 	  ;;
       p)
-          OSPREFIX="$OPTARG"
-          ;;
+      OSPREFIX="$OPTARG"
+      ;;
       o)
 	  OP="$OPTARG"
 	  ;;
@@ -61,26 +61,10 @@ if [[ -z $TARGET ]]; then
     if ! [[ -z $ARCHOVR ]]; then
         ARCH=$ARCHOVR
     fi
-    TARGET="$DISTRO-$ARCH"
+    TARGET="$CODENAME-$ARCH"
 fi
 
 TARGET=$OSPREFIX$TARGET
-
-#
-# $1 = local file path
-# $2 = type
-# $3 = content-type
-# $4 = filename
-#
-artifact() {
-    echo "doozer-artifact:$PWD/$1:$2:$3:$4"
-    echo "$PWD/$1" >> "$FILELIST"
-}
-
-versioned_artifact() {
-    echo "doozer-versioned-artifact:$PWD/$1:$2:$3:$4"
-    echo "$PWD/$1" >> "$FILELIST"
-}
 
 git status
 

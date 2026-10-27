@@ -1,12 +1,29 @@
 name: Coverity Scan
 
-# We only want to test official release code, not every pull request.
+# workflow_dispatch: allows manual runs from the Actions tab
+# schedule: runs a weekly scan at 0700 on Monday
+
 on:
-# Allows you to run this workflow manually from the Actions tab
+  schedule:
+    - cron: "0 7 * * 1"
   workflow_dispatch:
 
 jobs:
+  check-secret:
+      runs-on: ubuntu-latest
+      environment: Coverity
+      outputs:
+        token: ${{ steps.token.outputs.defined }}
+      steps:
+          - id: token
+            env:
+                TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+            if: "${{ env.TOKEN != '' }}"
+            run: echo "defined=true" >> $GITHUB_OUTPUT
+
   coverity:
+    needs: [check-secret]
+    if: needs.check-secret.outputs.token == 'true'
     runs-on: ubuntu-latest
     environment: Coverity
     steps:
@@ -16,9 +33,9 @@ jobs:
     - name: dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake git build-essential pkg-config gettext libavahi-client-dev libssl-dev zlib1g-dev wget bzip2 git-core liburiparser-dev libpcre2-dev libdvbcsa-dev python3 python3-requests debhelper ccache
+        sudo apt-get install -y cmake git build-essential pkg-config gettext libavahi-client-dev libssl-dev zlib1g-dev wget bzip2 git-core liburiparser-dev libpcre2-dev libdvbcsa-dev python3 python3-requests debhelper ccache libomxil-bellagio-dev libva-dev nvidia-cuda-dev
     - name: Configure
-      run: ./configure --disable-dvbcscan --disable-tvhcsa --enable-libfdkaac --enable-nvenc --enable-vaapi --enable-mmal --enable-omx
+      run: ./configure --disable-dvbcscan --enable-slow_memoryinfo --enable-libfdkaac --enable-nvenc --enable-vaapi --enable-omx
     - name: Download Coverity Build Tool
       run: |
         wget -q https://scan.coverity.com/download/linux64 --post-data "token=$TOKEN&project=tvheadend%2Ftvheadend" -O cov-analysis-linux64.tar.gz
